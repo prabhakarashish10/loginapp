@@ -1,5 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
+  AppState,
+  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -12,22 +14,105 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import type { Session } from '@supabase/supabase-js';
+
+import { supabase, supabaseConfigurationError } from '@/lib/supabase';
+
 type FormErrors = {
   email?: string;
   password?: string;
+};
+
+type AuthMode = 'signIn' | 'signUp';
+type AuthMessage = {
+  text: string;
+  type: 'error' | 'success';
 };
 
 export default function LoginScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
   const colors = isDark ? darkColors : lightColors;
+  const [session, setSession] = useState<Session | null>(null);
+  const [sessionStatePending, setSessionStatePending] = useState(true);
+  const [authMode, setAuthMode] = useState<AuthMode>('signIn');
+  const [busyAction, setBusyAction] = useState<AuthMode | 'signOut' | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [errors, setErrors] = useState<FormErrors>({});
-  const [submitted, setSubmitted] = useState(false);
+  const [authMessage, setAuthMessage] = useState<AuthMessage | null>(null);
+  const isRestoringSession = Boolean(supabase) && sessionStatePending;
+  const visibleAuthMessage: AuthMessage | null =
+    authMessage ??
+    (!supabase && supabaseConfigurationError
+      ? { text: supabaseConfigurationError, type: 'error' }
+      : null);
 
-  function handleLogin() {
+  useEffect(() => {
+    const client = supabase;
+    if (!client) return;
+
+    let isMounted = true;
+    const {
+      data: { subscription },
+    } = client.auth.onAuthStateChange((_event, nextSession) => {
+      if (!isMounted) return;
+      setSession(nextSession);
+      setSessionStatePending(false);
+      if (nextSession) {
+        setPassword('');
+        setAuthMessage(null);
+      }
+    });
+    const appStateSubscription =
+      Platform.OS === 'web'
+        ? null
+        : AppState.addEventListener('change', (state) => {
+            if (state === 'active') {
+              client.auth.startAutoRefresh();
+            } else {
+              client.auth.stopAutoRefresh();
+            }
+          });
+    if (Platform.OS !== 'web' && AppState.currentState === 'active') {
+      client.auth.startAutoRefresh();
+    }
+
+    void client.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!isMounted) return;
+        if (error) {
+          setAuthMessage({ text: error.message, type: 'error' });
+        } else {
+          setSession(data.session);
+        }
+        setSessionStatePending(false);
+      })
+      .catch((error: unknown) => {
+        if (!isMounted) return;
+        setAuthMessage({
+          text:
+            error instanceof Error
+              ? `Could not restore your session: ${error.message}`
+              : 'Could not restore your session. Please try again.',
+          type: 'error',
+        });
+        setSessionStatePending(false);
+      });
+
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+      appStateSubscription?.remove();
+      if (Platform.OS !== 'web') {
+        client.auth.stopAutoRefresh();
+      }
+    };
+  }, []);
+
+  function validateForm() {
     const nextErrors: FormErrors = {};
     const normalizedEmail = email.trim();
 
@@ -42,23 +127,122 @@ export default function LoginScreen() {
     }
 
     setErrors(nextErrors);
-    const isValid = Object.keys(nextErrors).length === 0;
-    setSubmitted(isValid);
-    if (isValid) {
-      setPassword('');
-    }
+    return Object.keys(nextErrors).length === 0;
   }
 
   function updateEmail(value: string) {
     setEmail(value);
     setErrors((current) => ({ ...current, email: undefined }));
-    setSubmitted(false);
+    setAuthMessage(null);
   }
 
   function updatePassword(value: string) {
     setPassword(value);
     setErrors((current) => ({ ...current, password: undefined }));
-    setSubmitted(false);
+    setAuthMessage(null);
+  }
+
+  async function handleAuthAction() {
+    if (!validateForm()) return;
+    if (!supabase) {
+      setAuthMessage({
+        text: supabaseConfigurationError ?? 'Supabase is not configured.',
+        type: 'error',
+      });
+      return;
+    }
+
+    setAuthMessage(null);
+    setBusyAction(authMode);
+    const normalizedEmail = email.trim();
+
+    try {
+      if (authMode === 'signIn') {
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: normalizedEmail,
+          password,
+        });
+        if (error) {
+          setAuthMessage({ text: error.message, type: 'error' });
+          return;
+        }
+        if (!data.session) {
+          setAuthMessage({
+            text: 'Sign-in did not return a session. Please try again.',
+            type: 'error',
+          });
+          return;
+        }
+        setSession(data.session);
+        setPassword('');
+      } else {
+        const { data, error } = await supabase.auth.signUp({
+          email: normalizedEmail,
+          password,
+        });
+        if (error) {
+          setAuthMessage({ text: error.message, type: 'error' });
+          return;
+        }
+        setPassword('');
+        if (data.session) {
+          setSession(data.session);
+        } else {
+          setAuthMessage({
+            text: 'If this email can be registered, check your inbox for a confirmation link. Then sign in.',
+            type: 'success',
+          });
+        }
+      }
+    } catch (error: unknown) {
+      setAuthMessage({
+        text:
+          error instanceof Error
+            ? error.message
+            : 'The authentication request failed. Please try again.',
+        type: 'error',
+      });
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleSignOut() {
+    if (!supabase) {
+      setAuthMessage({
+        text: supabaseConfigurationError ?? 'Supabase is not configured.',
+        type: 'error',
+      });
+      return;
+    }
+
+    setAuthMessage(null);
+    setBusyAction('signOut');
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        setAuthMessage({ text: error.message, type: 'error' });
+      } else {
+        setSession(null);
+        setPassword('');
+      }
+    } catch (error: unknown) {
+      setAuthMessage({
+        text:
+          error instanceof Error
+            ? error.message
+            : 'Sign-out failed. Please try again.',
+        type: 'error',
+      });
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  function toggleAuthMode() {
+    setAuthMode((current) => (current === 'signIn' ? 'signUp' : 'signIn'));
+    setErrors({});
+    setAuthMessage(null);
   }
 
   return (
@@ -77,100 +261,176 @@ export default function LoginScreen() {
             <View style={styles.heading}>
               <Text style={[styles.title, { color: colors.text }]}>Welcome to my world</Text>
               <Text style={[styles.subtitle, { color: colors.mutedText }]}>
-                Sign in to continue to your account.
+                {session
+                  ? 'You are signed in to your account.'
+                  : authMode === 'signIn'
+                    ? 'Sign in to continue to your account.'
+                    : 'Create an account with your email and password.'}
               </Text>
             </View>
 
-            <View style={styles.form}>
-              <View style={styles.field}>
-                <Text style={[styles.label, { color: colors.text }]}>Email</Text>
-                <TextInput
-                  accessibilityLabel="Email"
-                  autoCapitalize="none"
-                  autoComplete="email"
-                  autoCorrect={false}
-                  keyboardType="email-address"
-                  onChangeText={updateEmail}
-                  placeholder="you@example.com"
-                  placeholderTextColor={colors.placeholder}
-                  returnKeyType="next"
-                  style={[
-                    styles.input,
-                    {
-                      backgroundColor: colors.input,
-                      borderColor: errors.email ? colors.error : colors.border,
-                      color: colors.text,
-                    },
-                  ]}
-                  textContentType="emailAddress"
-                  value={email}
-                />
-                {errors.email ? (
-                  <Text
-                    accessibilityLiveRegion="polite"
-                    style={[styles.error, { color: colors.error }]}>
-                    {errors.email}
-                  </Text>
-                ) : null}
-              </View>
-
-              <View style={styles.field}>
-                <Text style={[styles.label, { color: colors.text }]}>Password</Text>
-                <View
-                  style={[
-                    styles.passwordRow,
-                    {
-                      backgroundColor: colors.input,
-                      borderColor: errors.password ? colors.error : colors.border,
-                    },
-                  ]}>
-                  <TextInput
-                    accessibilityLabel="Password"
-                    autoCapitalize="none"
-                    autoComplete="current-password"
-                    onChangeText={updatePassword}
-                    onSubmitEditing={handleLogin}
-                    placeholder="Enter your password"
-                    placeholderTextColor={colors.placeholder}
-                    returnKeyType="done"
-                    secureTextEntry={!showPassword}
-                    style={[styles.passwordInput, { color: colors.text }]}
-                    textContentType="password"
-                    value={password}
-                  />
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel={showPassword ? 'Hide password' : 'Show password'}
-                    onPress={() => setShowPassword((visible) => !visible)}
-                    style={styles.toggleButton}>
-                    <Text style={styles.toggleText}>{showPassword ? 'Hide' : 'Show'}</Text>
-                  </Pressable>
-                </View>
-                {errors.password ? (
-                  <Text
-                    accessibilityLiveRegion="polite"
-                    style={[styles.error, { color: colors.error }]}>
-                    {errors.password}
-                  </Text>
-                ) : null}
-              </View>
-
-              <Pressable
-                accessibilityRole="button"
-                onPress={handleLogin}
-                style={({ pressed }) => [
-                  styles.loginButton,
-                  pressed && styles.loginButtonPressed,
-                ]}>
-                <Text style={styles.loginButtonText}>Login</Text>
-              </Pressable>
-
-              {submitted ? (
-                <Text accessibilityLiveRegion="polite" style={styles.success}>
-                  Login successful
+            {isRestoringSession ? (
+              <View style={styles.loadingState}>
+                <ActivityIndicator color="#6545c2" />
+                <Text style={[styles.subtitle, { color: colors.mutedText }]}>
+                  Restoring your session...
                 </Text>
-              ) : null}
-            </View>
+              </View>
+            ) : session ? (
+              <View style={styles.form}>
+                <Text style={[styles.accountEmail, { color: colors.text }]}>
+                  {session.user.email ?? 'Email address unavailable'}
+                </Text>
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busyAction !== null}
+                  onPress={handleSignOut}
+                  style={({ pressed }) => [
+                    styles.loginButton,
+                    pressed && busyAction === null && styles.loginButtonPressed,
+                    busyAction !== null && styles.buttonDisabled,
+                  ]}>
+                  {busyAction === 'signOut' ? (
+                    <ActivityIndicator color="#ffffff" />
+                  ) : (
+                    <Text style={styles.loginButtonText}>Sign Out</Text>
+                  )}
+                </Pressable>
+                {visibleAuthMessage ? (
+                  <Text
+                    accessibilityLiveRegion="polite"
+                    style={[
+                      styles.authMessage,
+                      visibleAuthMessage.type === 'error'
+                        ? styles.authError
+                        : styles.authSuccess,
+                    ]}>
+                    {visibleAuthMessage.text}
+                  </Text>
+                ) : null}
+              </View>
+            ) : (
+              <View style={styles.form}>
+                <View style={styles.field}>
+                  <Text style={[styles.label, { color: colors.text }]}>Email</Text>
+                  <TextInput
+                    accessibilityLabel="Email"
+                    autoCapitalize="none"
+                    autoComplete="email"
+                    autoCorrect={false}
+                    editable={busyAction === null}
+                    keyboardType="email-address"
+                    onChangeText={updateEmail}
+                    placeholder="you@example.com"
+                    placeholderTextColor={colors.placeholder}
+                    returnKeyType="next"
+                    style={[
+                      styles.input,
+                      {
+                        backgroundColor: colors.input,
+                        borderColor: errors.email ? colors.error : colors.border,
+                        color: colors.text,
+                      },
+                    ]}
+                    textContentType="emailAddress"
+                    value={email}
+                  />
+                  {errors.email ? (
+                    <Text
+                      accessibilityLiveRegion="polite"
+                      style={[styles.error, { color: colors.error }]}>
+                      {errors.email}
+                    </Text>
+                  ) : null}
+                </View>
+
+                <View style={styles.field}>
+                  <Text style={[styles.label, { color: colors.text }]}>Password</Text>
+                  <View
+                    style={[
+                      styles.passwordRow,
+                      {
+                        backgroundColor: colors.input,
+                        borderColor: errors.password ? colors.error : colors.border,
+                      },
+                    ]}>
+                    <TextInput
+                      accessibilityLabel="Password"
+                      autoCapitalize="none"
+                      autoComplete={authMode === 'signUp' ? 'new-password' : 'current-password'}
+                      editable={busyAction === null}
+                      onChangeText={updatePassword}
+                      onSubmitEditing={handleAuthAction}
+                      placeholder="Enter your password"
+                      placeholderTextColor={colors.placeholder}
+                      returnKeyType="done"
+                      secureTextEntry={!showPassword}
+                      style={[styles.passwordInput, { color: colors.text }]}
+                      textContentType={authMode === 'signUp' ? 'newPassword' : 'password'}
+                      value={password}
+                    />
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={showPassword ? 'Hide password' : 'Show password'}
+                      disabled={busyAction !== null}
+                      onPress={() => setShowPassword((visible) => !visible)}
+                      style={styles.toggleButton}>
+                      <Text style={styles.toggleText}>{showPassword ? 'Hide' : 'Show'}</Text>
+                    </Pressable>
+                  </View>
+                  {errors.password ? (
+                    <Text
+                      accessibilityLiveRegion="polite"
+                      style={[styles.error, { color: colors.error }]}>
+                      {errors.password}
+                    </Text>
+                  ) : null}
+                </View>
+
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busyAction !== null || isRestoringSession}
+                  onPress={handleAuthAction}
+                  style={({ pressed }) => [
+                    styles.loginButton,
+                    pressed && busyAction === null && styles.loginButtonPressed,
+                    busyAction !== null && styles.buttonDisabled,
+                  ]}>
+                  {busyAction === authMode ? (
+                    <ActivityIndicator color="#ffffff" />
+                  ) : (
+                    <Text style={styles.loginButtonText}>
+                      {authMode === 'signIn' ? 'Sign In' : 'Create Account'}
+                    </Text>
+                  )}
+                </Pressable>
+
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busyAction !== null}
+                  onPress={toggleAuthMode}
+                  style={styles.modeButton}>
+                  <Text style={styles.modeButtonText}>
+                    {authMode === 'signIn'
+                      ? "Don't have an account? Sign Up"
+                      : 'Already have an account? Sign In'}
+                  </Text>
+                </Pressable>
+
+                {visibleAuthMessage ? (
+                  <Text
+                    accessibilityLiveRegion="polite"
+                    style={[
+                      styles.authMessage,
+                      visibleAuthMessage.type === 'error'
+                        ? styles.authError
+                        : styles.authSuccess,
+                    ]}>
+                    {visibleAuthMessage.text}
+                  </Text>
+                ) : null}
+              </View>
+            )}
 
           </View>
         </ScrollView>
@@ -243,6 +503,16 @@ const styles = StyleSheet.create({
   form: {
     gap: 20,
   },
+  loadingState: {
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 12,
+  },
+  accountEmail: {
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
   field: {
     gap: 8,
   },
@@ -294,15 +564,32 @@ const styles = StyleSheet.create({
   loginButtonPressed: {
     opacity: 0.82,
   },
+  buttonDisabled: {
+    opacity: 0.65,
+  },
   loginButtonText: {
     color: '#ffffff',
     fontSize: 16,
     fontWeight: '700',
   },
-  success: {
-    color: '#167647',
+  modeButton: {
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  modeButtonText: {
+    color: '#6545c2',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  authMessage: {
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  authError: {
+    color: '#b4233b',
+  },
+  authSuccess: {
+    color: '#167647',
   },
 });
